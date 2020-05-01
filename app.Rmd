@@ -1,0 +1,341 @@
+---
+title: "Florida Blue Dashboard"
+author: "Matthew Spiegel"
+date: "4/30/2020"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+```{r}
+library(tidyverse)
+library(ggforce)
+library(ggsci)
+library(mayotheme)
+library(leaflet)
+library(sf)
+```
+
+
+
+```{r}
+health_data <- read_csv("data/rawdata/health_data.csv") %>% janitor::clean_names()
+er_data <- read_csv("data/rawdata/er_data.csv") %>% janitor::clean_names()
+zip_data <- read_csv("data/rawdata/fl_zips.csv") %>% janitor::clean_names()
+load("data/processed/zips.Rdata")
+```
+
+Question 1
+============================
+
+Column {data-width=150}
+-----------------------------------------------------------------------
+
+### Info
+
+After initially looking at the ER visits by cost plot, it appeared that the cost decreased as the number
+of ER visits increased. This seems counterintuitive since you would expect the cost to increase as
+the number of ER visits increased. However, we were missing on variable, severity level. After grouping
+the points by severity level, the ellipses and colors show that there is infact a positive linear relationship
+between the number of ER visits and the overall cost. The relationship just exists within the subgroups of
+severity.
+
+Column
+-----------------------------------------------------------------------
+
+### ER cost by number of visits
+
+```{r}
+er_data <- er_data %>% 
+  mutate(severity_level = factor(severity_level, levels = c("Very Low", "Low", "Moderate", "High", "Very High")))
+er_data %>% 
+  ggplot(data = ., aes(x = er_visits, y = cost)) +
+  # geom_point() +
+  geom_jitter(aes(color = severity_level), size = 0.75, show.legend = F) +
+  theme_classic(base_size = 8) +
+  ggforce::geom_mark_ellipse(aes(fill = severity_level), alpha = 0.5) +
+  scale_fill_manual(
+    values = c(
+      mayotheme::mayocolors$blue,
+      mayotheme::mayocolors$red,
+      mayotheme::mayocolors$green,
+      mayotheme::mayocolors$yellow, 
+      mayotheme::mayocolors$purple
+      )
+    ) +
+  scale_color_manual(
+    values = c(
+      mayotheme::mayocolors$blue,
+      mayotheme::mayocolors$red,
+      mayotheme::mayocolors$green,
+      mayotheme::mayocolors$yellow, 
+      mayotheme::mayocolors$purple
+    )
+  ) + 
+  labs(fill = "Severity Level", x = "\nER Visits in the Past Year (#)", y = "Overall Cost ($)\n") +
+  theme(
+    legend.position = "bottom", 
+    plot.margin = unit(c(0.5, 0, 0.5, 0), "cm")
+  ) +
+  scale_x_continuous(breaks = seq(1, 11, 2), limits = c(1, 12)) +
+  scale_y_continuous(breaks = seq(15000, 55000, 10000), limits = c(15000, 55000))
+```
+
+
+Question 2
+============================
+
+Column {data-width=150}
+-----------------------------------------------------------------------
+
+### Info
+Using the `DBI` package in R I connected to a "database" and left joined the zip data
+to the health dataset. The query is in quotes within the R code.
+
+Column
+-----------------------------------------------------------------------
+
+### Bringing in the city and county for each patient
+
+```{r, echo = T}
+con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+copy_to(con, health_data)
+copy_to(con, zip_data)
+
+glue::glue_sql(
+  "
+  select
+    hd.patient_id,
+    zd.county,
+    zd.city
+  from health_data as hd
+  left join zip_data as zd
+  on hd.zip = zd.zip
+  ", .con = con
+) %>% 
+  DBI::dbGetQuery(con, statement = .)
+```
+
+
+Question 3
+============================
+
+Column {data-width=150}
+-----------------------------------------------------------------------
+
+### Info
+
+```{r}
+res <- health_data %>%
+  left_join(zip_data, by = "zip") %>% 
+  gather("condition", "value", -c(patient_id:er_count, er_copay:zip, city:longitude)) %>% 
+  filter(value == 1) %>% 
+  group_by(zip, condition) %>% 
+  summarise(
+    num_cc = n(),
+    cost_cc = median(hp_paid)
+  ) %>% 
+  ungroup() %>% 
+  arrange(desc(cost_cc)) %>% 
+  mutate(cost_cc = scales::dollar(cost_cc))
+
+mean_med_asthma <- res %>% 
+  filter(condition == "cc_asthma", zip != 32210) %>% 
+  pull(cost_cc) %>% 
+  str_remove("\\$") %>% 
+  str_remove(",") %>% 
+  as.numeric() %>% 
+  mean(na.rm = T) %>% 
+  scales::dollar()
+  
+```
+The first table to the right summarizes the cost data by zip code.
+
+* One possible suggestion based on this data is to target facilities within the zip codes with higher cost per patient and attempt some kind of intervention to bring the cost down. Obviously, we would want to look deeper into who exactly is causing this and if it is even the facilities fault and not the patient population itself.
+
+* Another thing that could be looked at is finding the lowest cost zip codes and attempting to funnel
+patients to the facilities within those zip codes.
+
+The second table to the right shows the median cost by zip and chronic condition
+
+* An idea would be to look at the facilities in the zip codes where the median cost for particular
+chronic conditions is much higher than the other counties. Maybe try dig deeper into why this might be
+the case. For example, zip 32068 has a median cost for asthma of $36,443 where as the others have an average median cost of `r mean_med_asthma`. Why is that zip so much higher? 
+
+Column
+-----------------------------------------------------------------------
+
+### Cost per patient by zip code
+
+```{r}
+health_data %>%
+  left_join(zip_data, by = "zip") %>% 
+  group_by(zip) %>% 
+  summarise(
+    num_pat = n(),
+    cost_pat = mean(hp_paid, na.rm = T)
+  ) %>% 
+  ungroup() %>% 
+  arrange(desc(cost_pat)) %>% 
+  mutate(cost_pat = scales::dollar(cost_pat)) %>% 
+  DT::datatable(
+    colnames = c("Zip Code", "Number of Patients", "Cost Per Patient"), 
+    options = list(
+ columnDefs = list(list(className = 'dt-center', targets = 1:3))
+    )
+  )
+  
+```
+
+
+### Median cost of particular chronic conditions by zip code
+
+```{r}
+res %>% 
+  mutate(condition = str_remove(condition, "cc_") %>% str_to_sentence()) %>% 
+  DT::datatable(
+    colnames = c("Zip Code", "Condition", "Number of Conditions", "Median Cost"), 
+    options = list(
+ columnDefs = list(list(className = 'dt-center', targets = 1:4))
+)
+  )
+```
+
+
+Question 4
+============================
+
+Column {data-width=200}
+-----------------------------------------------------------------------
+
+### Info
+
+* The most prevalent chronic conditions are Asthma with 908 cases, followed by Hypertension with 804
+and finally Hyperlipidemia with 758. A quick google search shows that Hypertension and Hyperlipidemia
+are related and that Hyperlipidemai is prevelant in Hypertension so those both being prevalent together
+makes sense.
+
+* If you look at the correlation plot to the right, it appears that COPD and asthma are correlated
+which makes sense since COPD is chronic emphesema and bronchitis which, similar to asthma, is a condition
+of the lungs. Also, heart failure and stroke are correlated which isn't shocking either since stroke can
+lead to heart failure. The final conditions that appear to be somewhat correlated are hypertension and
+hyperlipedemia which as explained above makes sense.
+
+Column {data-width = 100}
+-----------------------------------------------------------------------
+
+### Most prevalent chronic conditions
+
+```{r}
+health_data %>% 
+  gather("condition", "value", -c(patient_id:er_count, er_copay:zip)) %>% 
+  filter(value == 1) %>% 
+  count(condition) %>% 
+  top_n(3, n) %>% 
+  arrange(desc(n)) %>% 
+  mutate(condition = str_remove(condition, "cc_") %>% str_to_title()) %>% 
+  DT::datatable(
+    colnames = c("Condition", "N"), 
+    options = list(
+ columnDefs = list(list(className = 'dt-center', targets = 1:2))
+)
+  )
+  # mRclwhip::format_flextable(header1 = list(values = c("Condition", "N"))) %>% 
+  # flextable::fit_to_width()
+  
+```
+
+Column {data-width = 200}
+-----------------------------------------------------------------------
+
+### Relationships between chronic conditions
+
+```{r}
+curr_names <- health_data %>% 
+  select(starts_with("cc"), -cc_count) %>% 
+  names()
+new_names <- curr_names %>% 
+  str_remove("cc_") %>% 
+  str_to_sentence() %>% 
+  str_replace_all("_", " ")
+health_data2 <- health_data %>% 
+  select(one_of(curr_names)) %>% 
+  rename(!!!set_names(curr_names, new_names))
+cor_res <- cor(health_data2)
+corrplot::corrplot(cor_res, method = "circle")
+```
+
+
+
+Question 5
+============================
+
+Column {data-width=150}
+-----------------------------------------------------------------------
+
+### Info
+
+Select a condition in the dropdown. To see details on cost per patient by condition in a particular zip code, select the zip.
+
+
+```{r}
+selectInput(
+  "condition",
+  "Condition",
+  choices = unique(total_cost_zip$condition),
+  selected = "All"
+)
+
+map_condition <- reactive({
+  req(input$condition)
+  
+  condition_zip <- total_cost_zip %>% 
+    filter(condition == input$condition) %>% 
+    ungroup() %>% 
+    mutate_at("zip", as.character)
+
+  zips_fl %>% 
+    inner_join(condition_zip, by = c("ZCTA5CE10" = "zip"))
+})
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Regional Map
+
+
+```{r}
+output$regional_map <- renderLeaflet({
+  
+  
+  req(map_condition())
+  
+  pal <- colorNumeric(palette = "Reds", domain = map_condition()$total_cost)
+  
+  map <- leaflet(map_condition()) %>% 
+    addPolygons(
+      fillColor = ~pal(total_cost), 
+      popup = ~glue::glue("Average cost per patient: {scales::dollar(total_cost)}"),
+      weight = 2,
+      opacity = 1,
+      color = "white",
+      dashArray = "3",
+      fillOpacity = 0.7
+    ) %>% 
+    addProviderTiles('CartoDB.Positron')
+  
+  map
+    
+})
+
+leafletOutput("regional_map")
+```
+
